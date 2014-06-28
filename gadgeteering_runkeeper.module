@@ -1,0 +1,797 @@
+<?php
+
+const GADGETEERING_RUNKEEPER_URL_TOKEN = 'https://runkeeper.com/apps/token';
+const GADGETEERING_RUNKEEPER_URL_AUTH = 'https://runkeeper.com/apps/authorize';
+const GADGETEERING_RUNKEEPER_URL_API = 'https://api.runkeeper.com';
+
+// Block Ids
+const GADGETEERING_RUNKEEPER_BLOCK_ACTIVITIES = 'gadget_running_activities';
+
+// Form Ids.
+const GADGETEERING_RUNKEEPER_FIELD_SUBMIT = 'submit';
+const GADGETEERING_RUNKEEPER_FIELD_ACTION = 'form_action';
+const GADGETEERING_RUNKEEPER_FIELD_REDIRECT = 'redirect_url';
+
+// Paths
+const GADGETEERING_RUNKEEPER_PATH_ADMIN = 'admin/settings/runkeeper';
+const GADGETEERING_RUNKEEPER_PATH_AUTHORIZE = 'runkeeper/authorize/%';
+const GADGETEERING_RUNKEEPER_PATH_DEAUTHORIZE = 'runkeeper/authorize/%';
+const GADGETEERING_RUNKEEPER_PATH_PROFILE = 'user/%/runkeeper';
+const GADGETEERING_RUNKEEPER_PATH_TOKEN = 'runkeeper/token';
+
+// Variable indexes.
+const GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID = 'gadgeteering_runkeeper_client_id';
+const GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_SECRET = 'gadgeteering_runkeeper_client_secret';
+const GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT = 'gadgeteering_runkeeper_update_count';
+const GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE = 'gadgeteering_runkeeper_block_size';
+const GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE = 'gadgeteering_runkeeper_history_size';
+const GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS = 'gadgeteering_runkeeper_update_events';
+const GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC = 'gadgeteering_runkeeper_disable_sync';
+
+function _gadgeteering_runkeeper_block_display(){
+    $content = '<h2>Activity Feed</h2>';
+    
+    $activityRows = db_query(sprintf('SELECT * FROM gadgeteering_runkeeper_activities ORDER BY start DESC LIMIT %s',
+        _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE)));
+    $profileInfo = array();
+    
+    
+    foreach($activityRows as $activity){
+        if(!array_key_exists($activity->uid,$profileInfo)){
+            $profileInfo[$activity->uid] = db_query('SELECT * FROM gadgeteering_runkeeper_users WHERE uid = :uid',array(':uid'=>$activity->uid))->fetchObject();
+            if(!$profileInfo[$activity->uid]){
+                // Something went wrong with our lookup.
+                continue;
+            }
+        }
+        $content .= sprintf('<div class="gadgeteering-runkeeper-activity"><p><strong>%s</strong>:</p><p class="details">%.2f km %s activity</p><p class="details">Date: <em>%s</em></p><p class="details">Duration: <em>%s</em></p></div>',
+            $profileInfo[$activity->uid]->runkeeper_full_name, $activity->distance/1000, strtolower($activity->type), date('Y-m-d',$activity->start), _gadgeteering_runkeeper_format_duration($activity->end - $activity->start));
+    }
+    
+    return $content;
+}
+
+function _gadgeteering_runkeeper_debug_message($message,$level='warning'){
+    global $user;
+    //if($user->uid == 1){
+        drupal_set_message($message,$level);
+    
+}
+
+/**
+ * 
+ * Translates a RunKeeper error string into a tidily-formatted English message.
+ * 
+ */
+function _gadgeteering_runkeeper_get_error_message($errorCode){
+    switch($errorCode){
+        case 'invalid_grant':
+            drupal_set_message('Invalid RunKeeper grant.','error');
+        default:
+            drupal_set_message(sprintf('Unknown RunKeeper error: %s',$errorCode),'error');
+    }
+}
+
+/**
+ * Construct the URL for requesting an authorization code for a user's account.
+ */ 
+function _gadgeteering_runkeeper_get_url_authorize($uid){
+    
+    $returnUrl = urlencode(_gadgeteering_runkeeper_get_url_return($uid));
+    _gadgeteering_runkeeper_debug_message('Return URL: ' . urldecode($returnUrl));
+    
+    // Return value for function.
+    $returnValue = sprintf('%s?client_id=%s&redirect_uri=%s&response_type=code&state=',
+        GADGETEERING_RUNKEEPER_URL_AUTH,
+        _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID),
+        $returnUrl);
+        
+    _gadgeteering_runkeeper_debug_message('Full Authorize URL: ' . $returnValue);
+    return $returnValue;
+}
+
+function _gadgeteering_runkeeper_get_url_return($uid){
+    global $is_https;
+    $port = (in_array($_SERVER['SERVER_PORT'],array(80,443))) ? '' : ':' . $_SERVER['SERVER_PORT'];
+    return (($is_https) ? 'https://' : 'http://') . $_SERVER['SERVER_NAME'] . $port .  base_path() . GADGETEERING_RUNKEEPER_PATH_TOKEN . '/' . $uid;
+}
+
+function gadgeteering_runkeeper_node_view($node, $view_mode, $langcode){
+    drupal_set_message('Loading a node!');
+}
+
+
+/**
+ * 
+ * @param stdClass $runKeeperUser
+ *      An object containing a user's fields from their entry in the gadgeteering_runkeeper_users table.
+ */
+function _gadgeteering_runkeeper_update_user($runKeeperUser){
+    $recentActivities = _gadgeteering_runkeeper_do_get_query($runKeeperUser->token,'/fitnessActivities',array('pageSize'=>_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE)));
+    //drupal_set_message(print_r($recentActivities,1));
+    if($recentActivities->httpCode == 403){
+        // If we get a 403 code, then the user has removed themselves from this RunKeeper app.
+        // Respect their decision by purging them from the RunKeeper-related database tables.
+        
+        _gadgeteering_runkeeper_debug_message('Received 403 code. User has disconnected from RunKeeper. Purging entries.');
+        
+        db_query(sprintf('DELETE FROM gadgeteering_runkeeper_users WHERE uid = %d',$runKeeperUser->uid));
+        db_query(sprintf('DELETE FROM gadgeteering_runkeeper_activities WHERE uid = %d',$runKeeperUser->uid));
+        return;
+    }
+    
+    foreach($recentActivities->items as $activity){
+        
+        // Get array from a breakdown of the activity URI.
+        $activityArray = explode('/',$activity->uri);
+        // Get activity ID number.
+        $aid = $activityArray[2];
+        
+        // Make sure that the activity has not already been added for this user.
+        // NOTE: Check if the user has already queried for this activity.
+        $activityObj = db_query('SELECT a.uid, a.aid FROM gadgeteering_runkeeper_activities a WHERE a.uid = 1 AND runkeeper_aid = :aid', array(':aid'=>$aid))->fetchObject(); 
+        
+        if(!(($activityObj && _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS))
+            || !$activityObj)){
+                // If this block was triggered on its own:
+                //   - The activity was found in the database, and we have chosen not to update the activity.
+            _gadgeteering_runkeeper_debug_message(sprintf('RunKeeper activity exists (#%d), and we have chosen not to update the activity.',$activityObj->aid));
+            continue;
+        }
+        
+        // Get the details for the activity.
+        $activityDetails = _gadgeteering_runkeeper_do_get_query($runKeeperUser->token,$activity->uri);
+        
+        _gadgeteering_runkeeper_debug_message(sprintf('New activity: %s',$activity->uri));
+        
+        // Calculate the fields that aren't already provided for us in the activity objects.
+        $startTime = @strtotime($activityDetails->start_time);
+        $endTime = $startTime + (int)$activityDetails->duration;
+        
+        $substitutions = array(':uid'=>$runKeeperUser->uid,
+            ':runkeeper_aid'=>$aid,
+            ':runkeeper_uid'=>$runKeeperUser->runkeeper_uid,
+            ':start_time'=>$startTime,
+            ':end_time'=>$endTime,
+            ':distance'=>$activityDetails->total_distance,
+            ':calories'=>$activityDetails->total_calories,
+            ':ascent'=>$activityDetails->climb,
+            ':start_elevation'=>$activityDetails->path[0]->altitude,
+            ':start_lat'=>$activityDetails->path[0]->latitude,
+            ':start_long'=>$activityDetails->path[0]->longitude,
+            ':end_elevation'=>$activityDetails->path[sizeof($activityDetails->path)-1]->altitude,
+            ':end_lat'=>$activityDetails->path[sizeof($activityDetails->path)-1]->latitude,
+            ':end_long'=>$activityDetails->path[sizeof($activityDetails->path)-1]->longitude,
+            ':uri'=>$activity->uri,
+            ':type'=>$activity->type
+            );
+            
+        if($activityObj){
+            // Updates
+            
+            $query =  'UPDATE gadgeteering_runkeeper_activities
+                SET `uid`=:uid, `runkeeper_aid`=:runkeeper_aid, `runkeeper_uid`=:runkeeper_uid,
+                `start`=:start_time,`end`=:end_time,`distance`=:distance,`calories`=:calories,
+                `ascent`=:ascent,`start_elevation`=:start_elevation,`start_lat`=:start_lat,`start_long`=:start_long,
+                `end_elevation`=:end_elevation,`end_lat`=:end_lat,`end_long`=:end_long,`uri`=:uri,`type`=:type)';
+                
+            db_query($query,$substitutions);
+            
+        } else {
+            // New
+            $query =  'INSERT INTO gadgeteering_runkeeper_activities
+                (`uid`, `runkeeper_aid`, `runkeeper_uid`, `filed`,
+                `start`,`end`,`distance`,`calories`,
+                `ascent`,`start_elevation`,`start_lat`,`start_long`,
+                `end_elevation`,`end_lat`,`end_long`,`uri`,`type`) VALUES
+                (:uid,:runkeeper_aid,:runkeeper_uid,:filed,
+                :start_time,:end_time,:distance,:calories,
+                :ascent, :start_elevation, :start_lat, :start_long,
+                :end_elevation, :end_lat, :end_long, :uri, :type)';
+            
+            $substitutions[':filed']=time();
+                
+            db_query($query,$substitutions);
+        }
+        
+        
+        // Update when the user was last updated.
+        db_query('UPDATE gadgeteering_runkeeper_users SET last_updated=:time WHERE uid=:uid',
+            array(':time'=>time(),':uid'=>$runKeeperUser->uid));
+        
+    }
+}
+
+function _gadgeteering_runkeeper_update_users(){
+    
+    _gadgeteering_runkeeper_debug_message('Performing RunKeeper data update.');
+        
+    _gadgeteering_runkeeper_debug_message(sprintf('Sync disable: %d' ,_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC)));
+    _gadgeteering_runkeeper_debug_message(sprintf('User update count: %d',_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT)));
+    
+    if(!_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC) 
+        && _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT)){
+        
+
+        $query = sprintf('SELECT * FROM gadgeteering_runkeeper_users ORDER BY last_updated LIMIT %d',_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT));
+        _gadgeteering_runkeeper_debug_message(sprintf('Update query debug: "%s"',$query));
+
+        $userResults = db_query($query);
+        while($account = $userResults->fetchObject()){
+            _gadgeteering_runkeeper_debug_message(sprintf('Processing RunKeeper updates for user #%d',$account->uid));
+            _gadgeteering_runkeeper_update_user($account);
+        }
+    } else {
+        _gadgeteering_runkeeper_debug_message('Updates have been disabled.');
+    }
+}
+
+function gadgeteering_runkeeper_admin(){
+    $form = array();
+    
+    $form['#validate'] = array('gadgeteering_runkeeper_admin_validate');
+    $form['#submit'] = array('gadgeteering_runkeeper_admin_submit');
+    
+    $form['connection_fields'] = array(
+        '#type' => 'fieldset',
+        '#title' => 'RunKeeper Connection',
+        '#collapsible' => True,
+        '#description' => 'Settings for your RunKeeper app.',
+        '#weight'=>-50,
+    );
+    
+        $form['connection_fields'][GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID] = array(
+            '#title'=>'Application Client Id',
+            '#description'=>'Your RunKeeper Application\'s ID.',
+            '#type'=>'textfield',
+            '#default_value' => _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID),
+            '#weight'=>-50,
+        );
+        
+        $form['connection_fields'][GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_SECRET] = array(
+            '#title'=>'Application Client Id',
+            '#description'=>'Oauth Secret used to connect to RunKeeper.',
+            '#type'=>'textfield',
+            '#default_value' => _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_SECRET),
+            '#weight'=>-49,
+        );
+    
+    $form['poll_settings'] = array(
+        '#type' => 'fieldset',
+        '#title' => 'Poll Settings',
+        '#collapsible' => True,
+        '#description' => 'Settings for pulling user information from RunKeeper.',
+        '#weight'=>-49,
+    );
+    
+        $form['poll_settings'][GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT] = array(
+          '#type' => 'textfield',
+          '#title' => t('User Count'),
+          '#default_value' => strval(_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT)),
+          '#description' => t('Number of users to get activities for per run of cron. Users with the longest time since an update will be updated first.'),
+          '#weight'=>-50,
+        );
+        
+        $form['poll_settings'][GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE] = array(
+          '#type' => 'textfield',
+          '#title' => t('User Activity Count'),
+          '#default_value' => strval(_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE)),
+          '#description' => t('Number of activities to get per user when updating.'),
+          '#weight'=>-49,
+        );
+        
+        $form['poll_settings'][GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS] = array(
+            '#type' => 'checkbox',
+            '#title' => t('Update Activities'),
+            '#default_value' => _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS) ? 1:null,
+            '#description' => t('If selected, activities will be checked for updates when cron runs.'),
+            '#weight'=>-48,
+        );
+        
+        $form['poll_settings'][GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC] = array(
+            '#type' => 'checkbox',
+            '#title' => t('Disable Sync'),
+            '#default_value' => _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC) ? 1:null,
+            '#description' => t('Disable Sync without de-activating the RunKeeper module.'),
+            '#weight'=>-47,
+        );
+    
+    $form['display_settings'] = array(
+        '#type' => 'fieldset',
+        '#title' => 'Display Settings',
+        '#collapsible' => True,
+        '#weight'=>-48,
+    );
+    
+        $form['display_settings'][GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE] = array(
+          '#type' => 'textfield',
+          '#title' => t('Block Size Count'),
+          '#default_value' => strval(_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE)),
+          '#description' => t('Number of activities to display in the RunKeeper activity feed block.'),
+          '#weight'=>-50,
+        );
+    
+    $form['submit'] = array(
+        '#type'=>'submit',
+        '#value'=>'Save Settings',
+        '#weight'=>50
+    );
+    
+    return $form;
+    
+}
+
+/**
+ * Central location for defaults.
+ */
+function _gadgeteering_runkeeper_variable_get($index){
+    
+    // Default default.
+    $default = '';
+    
+    switch($index){
+        case GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE:
+        case GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT:
+            $default = 10;
+            break;
+        case GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE:
+            $default = 5;
+            break;
+        case GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS:
+        case GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC:
+            $default = 0;
+            break;
+    }
+    
+    //_gadgeteering_runkeeper_debug_message(gettype($default));
+    
+    // Check if we need to cast the variable.
+    switch(gettype($default)){
+        case 'int':
+            return (int)variable_get($index,$default);
+        default:
+            return variable_get($index,$default);
+    }
+}
+
+function gadgeteering_runkeeper_admin_validate($form,&$form_state){
+    if(!((int)$form[GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT] > 0)){
+        form_set_error($form[GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT],'Number of users to update must be a positive integer.');
+    }
+    
+    if(!((int)$form[GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE] > 0)){
+        form_set_error($form[GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE],'History size must be a positive integer.');
+    }
+    
+    if(!((int)$form[GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE] > 0)){
+        form_set_error($form[GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE],'Block size must be a positive integer.');
+    }
+    
+    
+}
+
+function gadgeteering_runkeeper_admin_submit($form,&$form_state){
+    $values = $form_state['values'];
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID,$values[GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID]);
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_SECRET,$values[GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_SECRET]);
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT,$values[GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT]);
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE,$values[GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE]);
+    
+    //drupal_set_message(print_r($values,1));
+    //drupal_set_message('sync: ' . empty($values[GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC]) ? 0 : 1);
+    
+    //variable_set(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS,(empty($values[GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS])) ? 0 : 1);
+    //variable_set(GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC,(empty($values[GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC])) ? 0 : 1);
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS,$values[GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_EVENTS]);
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC,$values[GADGETEERING_RUNKEEPER_VARIABLE_DISABLE_SYNC]);
+    
+    variable_set(GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE,$values[GADGETEERING_RUNKEEPER_VARIABLE_BLOCK_SIZE]);
+    
+    drupal_set_message('Settings updated.');
+}
+
+function gadgeteering_runkeeper_block_info(){
+  $blocks[GADGETEERING_RUNKEEPER_BLOCK_ACTIVITIES] = array(
+    // The private name that will appear in the block list.
+    'info' => t('Runkeeper Activities'),
+    // Default setting for caching.
+    'cache' => DRUPAL_CACHE_PER_ROLE,
+  );
+  return $blocks;
+}
+
+function gadgeteering_runkeeper_block_view($blockId){
+    drupal_set_message('Id: ' . $blockId);
+    
+    $block = array();
+    
+    switch($blockId){
+        case GADGETEERING_RUNKEEPER_BLOCK_ACTIVITIES:
+            $block['content'] = _gadgeteering_runkeeper_block_display();
+            break;
+    }
+    
+    return $block;
+}
+
+/**
+ * Switchboard to send user to the RunKeeper authorization request page.
+ */
+function _gadgeteering_runkeeper_page_authorize(){
+    _gadgeteering_runkeeper_debug_message('Auth Code Request URL (' . current_path() . ')');
+    
+    $args = explode('/',current_path());
+    if(sizeof($args) < 2){
+        throw new Exception('Invalid profile page arguments.');
+    }
+    
+    $uid = $args[2];
+    global $user;
+    
+    _gadgeteering_runkeeper_debug_message('Path UID: ' . $uid);
+    _gadgeteering_runkeeper_debug_message('User UID: ' . $user->uid);
+    
+    if($uid == 0 || ($user->uid != 1 && $user->uid != (int)$uid)){
+        drupal_set_message('Invalid User','error');
+        drupal_goto('<front>');
+        exit;
+    }
+    
+    $destination = _gadgeteering_runkeeper_get_url_authorize($user->uid);
+    header('Location: ' . $destination, TRUE, 302);
+    drupal_exit($destination);
+    
+}
+
+/**
+ * Switchboard for handling de-authorizations from RunKeeper via Drupal
+ */
+function _gadgeteering_runkeeper_page_deauthorize(){
+    global $user;
+    
+    $args = explode('/',current_path());
+    if(sizeof($args) < 2){
+        throw new Exception('Invalid profile page arguments.');
+    }
+    
+    $uid = $args[2];
+    global $user;
+    
+    _gadgeteering_runkeeper_debug_message('Path UID: ' . $uid);
+    _gadgeteering_runkeeper_debug_message('User UID: ' . $user->uid);
+    
+    if($uid == 0 || ($user->uid != 1 && $user->uid != (int)$uid)){
+        drupal_set_message('Invalid User','error');
+        drupal_goto('<front>');
+        exit;
+    }
+    
+    // TODO: Replace with redirect logic.
+    // NYI
+    drupal_set_message('Disconnecting from RunKeeper via Drupal is not yet implemented. Please disconnect through your RunKeeper settings for the moment.');
+    drupal_goto('<front>');
+    exit;
+}
+
+/**
+ * Switchboard to handle redirects from the RunKeeper authorization page.
+ */
+function _gadgeteering_runkeeper_page_token(){
+    _gadgeteering_runkeeper_debug_message('Token Request URL (' . current_path() . ')');
+    
+    $args = explode('/',current_path());
+    if(sizeof($args) < 2){
+        throw new Exception('Invalid profile page arguments.');
+    }
+    $uid = $args[2];
+    global $user;
+    
+    if($uid == 0 || ($user->uid != 1 && $user->uid != (int)$uid)){
+        drupal_set_message('Invalid User','error');
+        drupal_goto('<front>');
+        exit;
+    }
+    
+    if(empty($_GET['code'])){
+        drupal_set_message('No authorization code given.','error');
+        drupal_goto('<front>');
+        exit;
+    } else {
+        _gadgeteering_runkeeper_debug_message('Authorization Code: ' . $_GET['code']);
+    }
+    
+    // If the user is still on this page, they have an authorization code that we want to exchange for a token.
+    
+    // Linking a user to their RunKeeper profile.
+    
+    // POST Arguments for CURL
+    $params = http_build_query(array(
+        'grant_type'	=>	'authorization_code',
+        'code'	=>	$_GET['code'],
+        'client_id'	=>	_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_ID),
+        'client_secret'	=>	_gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_CLIENT_SECRET),
+        'redirect_uri'	=>	_gadgeteering_runkeeper_get_url_return($user->uid),
+        ));
+        
+    // Options for CURL connection.
+    $options = array(
+        CURLOPT_URL	=>	GADGETEERING_RUNKEEPER_URL_TOKEN,
+        CURLOPT_POST	=>	true,
+        CURLOPT_POSTFIELDS	=>	$params,
+        CURLOPT_RETURNTRANSFER	=>	true
+        );
+        
+    // Set up CURL client.
+    $curl = curl_init();
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false); /* Added to avoid "error :SSL certificate problem, verify that the CA cert is OK" */
+    curl_setopt_array($curl,$options);
+    
+    $response = curl_exec($curl);
+    $responseCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    $errorCode = curl_errno($curl);
+    curl_close($curl);
+    
+    if($response){
+        _gadgeteering_runkeeper_debug_message('JSON Data: ' . $response);
+        
+        $responseObj = json_decode($response);
+        
+        if(!empty($responseObj->error) && $responseObj->error == 'invalid_grant'){
+            _gadgeteering_runkeeper_get_error_message($responseObj->error);
+            drupal_goto('<front>');
+            exit;
+        }
+                
+        $runKeeperProfile = _gadgeteering_runkeeper_do_get_query($responseObj->access_token,'/profile');
+        _gadgeteering_runkeeper_debug_message('User profile: ' . print_r($runKeeperProfile,True));
+        
+        if($runKeeperProfile->drupalSuccess){
+            
+            $rUidArray = explode('/',$runKeeperProfile->profile);
+            $rUid = $rUidArray[4];
+            
+            $query = 'INSERT INTO `gadgeteering_runkeeper_users`
+                (`uid`,`runkeeper_uid`,`runkeeper_full_name`,`token`,`last_updated`)
+                VALUES (:uid,:ruid,:full_name,:token,:time)';
+                
+            db_query($query,
+                array(':uid'=>$uid,':ruid'=>$rUid,':full_name'=>$runKeeperProfile->name,
+                    ':token'=>$responseObj->access_token,':time'=>time())
+            );
+            
+            drupal_set_message(sprintf('Your user account has been joined to %s\'s RunKeeper profile.',$runKeeperProfile->name));
+            drupal_goto(sprintf('user/%d/runkeeper',$uid));
+            exit;
+            
+        } else {
+            // Something went wrong with our query.
+            drupal_set_message('Error retrieving data from RunKeeper.','error');
+            drupal_goto('<front>');
+            exit;
+        }
+    } else {
+        drupal_set_message('No response from RunKeeper','error');
+        drupal_goto('<front>');
+        exit;
+    }
+    
+    drupal_set_message('Fallback redirect to front page.','error');
+    drupal_goto('<front>');
+    exit;
+}
+
+function _gadgeteering_runkeeper_do_get_query($token, $path, $getArguments=array(), $acceptCode = False, $printDebug=False){
+        
+    if(!$acceptCode){
+        $acceptCode = _gadgeteering_runkeeper_get_content_code($path);
+    }
+    
+    $getArgumentsString = '';
+    if(!empty($getArguments)){
+        $getArgumentsString = '?';
+        $getArgumentsArray = array();
+        foreach($getArguments as $key=>$value){
+            $getArgumentsArray[] = $key . '=' . $value;
+        }
+        $getArgumentsString .=  implode('&',$getArgumentsArray);
+    }
+    
+    // Options for CURL connection.
+    $options = array(
+        CURLOPT_URL	=>GADGETEERING_RUNKEEPER_URL_API . $path . $getArgumentsString,
+        CURLOPT_RETURNTRANSFER	=>	true,
+        CURLOPT_HTTPHEADER => array(
+            sprintf('Authorization: Bearer %s',$token),
+            sprintf('Accept: %s',$acceptCode),
+            ),
+        );
+        
+    // Set up CURL client.
+    $curl = curl_init();
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false); /* Added to avoid "error :SSL certificate problem, verify that the CA cert is OK" */
+    curl_setopt_array($curl,$options);
+    
+    $response = curl_exec($curl);
+    $responseCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    $errorCode = curl_errno($curl);
+    curl_close($curl);
+    
+    if($printDebug){
+        _gadgeteering_runkeeper_debug_message($response);
+    }
+    
+    if($errorCode == 0 && $responseCode == 200){
+        $ret = json_decode($response);
+        
+        // Giving this object a property that wouldn't show up in the raw response so that we know it was successful.
+        $ret->drupalSuccess = 1;
+        
+        // Attaching return codes, just in case.
+        $ret->httpCode = $responseCode;
+        $ret->errorCode = $errorCode;
+        return $ret;
+    }
+    
+    $ret = new stdClass();
+    $ret->drupalSuccess = 0;
+    $ret->httpCode = $responseCode;
+    $ret->errorCode = $errorCode;
+    $ret->content = $response;
+    return $ret;
+}
+
+function _gadgeteering_runkeeper_format_duration($duration){
+    $hours = (int)$duration / 60 / 60;
+    $minutes = (int)$duration / 60 % 60;
+    $seconds = (int)$duration % 60;
+    return sprintf('%dh, %dm, %ds',$hours,$minutes,$seconds);
+}
+
+function _gadgeteering_runkeeper_get_content_code($path){
+    
+    // Basic cases.
+    switch($path){
+        case '/user':
+            return 'application/vnd.com.runkeeper.User+json';
+            break;
+        case '/fitnessActivities':
+            return 'application/vnd.com.runkeeper.FitnessActivityFeed+json';
+            break;
+        case '/profile':
+            return 'application/vnd.com.runkeeper.Profile+json';
+            break;
+        default:
+            break;
+    }
+    
+    // Handle special cases.
+    if(strpos($path, '/fitnessActivities/') === 0){
+        return 'application/vnd.com.runkeeper.FitnessActivity+json';
+    }
+    
+    // If nothing else, throw an exception.
+    throw new Exception('Unknown RunKeeper content code.');
+}
+
+function gadgeteering_runkeeper_cron(){
+    $queue = DrupalQueue::get('gadgeteering_runkeeper_feed');
+    $queue->createItem(array());
+}
+
+function gadgeteering_runkeeper_cron_queue_info(){
+    // We already have the $queues variable provided to us.
+    $queues['gadgeteering_runkeeper_feed'] = array(
+        'worker callback'=>'_gadgeteering_runkeeper_update_users',
+        'time' => (
+            10 
+            * _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_UPDATE_COUNT)
+            * _gadgeteering_runkeeper_variable_get(GADGETEERING_RUNKEEPER_VARIABLE_HISTORY_SIZE)
+            ),
+        'skip on cron' => False,
+    );
+    
+    return $queues;
+}
+
+function gadgeteering_runkeeper_menu(){
+    
+    $items = array();
+    
+    // For users returning from getting an authorization code.
+    $items[GADGETEERING_RUNKEEPER_PATH_TOKEN] = array(
+        'page callback' => '_gadgeteering_runkeeper_page_token',
+        'access callback' => TRUE,
+        'menu_name' => 'norender',
+    );
+    
+    $items[GADGETEERING_RUNKEEPER_PATH_AUTHORIZE] = array(
+        'page callback' => '_gadgeteering_runkeeper_page_authorize',
+        'access callback' => True,
+        'menu_name' => 'norender',
+    );
+    
+    $items[GADGETEERING_RUNKEEPER_PATH_DEAUTHORIZE] = array(
+        'page callback' => '_gadgeteering_runkeeper_page_deauthorize',
+        'access callback' => True,
+        'menu_name' => 'norender',
+    );
+    
+    $items[GADGETEERING_RUNKEEPER_PATH_PROFILE] = array(
+        'title' => 'Runkeeper',
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('_gadgeteering_runkeeper_form_profile'),
+        'access callback' => TRUE,
+        'type'=> MENU_LOCAL_TASK,
+    );
+    
+    $items[GADGETEERING_RUNKEEPER_PATH_ADMIN] = array(
+    'title' => 'RunKeeper Settings',
+    'description' => 'Manage settings for RunKeeper connection.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('gadgeteering_runkeeper_admin'),
+    'access arguments' => array('administer runkeeper settings'),
+    'type' => MENU_NORMAL_ITEM,
+   );
+  return $items;
+    
+    return $items;
+}
+
+function gadgeteering_runkeeper_permission(){
+    return array(
+        'administer runkeeper settings' => array(
+            'title' => t('Administer RunKeeper'),
+            'description' => t('Configure RunKeeper Connection'),
+        ),
+    );
+}
+
+function _gadgeteering_runkeeper_form_profile($form,&$form_state){
+    $args = explode('/',current_path());
+    if(sizeof($args) < 2){
+        throw new Exception('Invalid profile page arguments.');
+    }
+    $uid = $args[1];
+    $profile = _gadgeteering_runkeeper_get_user_profile($uid);
+    
+    //$form['#validate'] = array('_gadgeteering_runkeeper_form_validate');
+    
+    if($profile){
+        
+        $form['#action'] = base_path() . 'runkeeper/deauthorize/' . $uid;
+        
+        // User is joined to runkeeper.
+        $form[GADGETEERING_RUNKEEPER_FIELD_SUBMIT] = array(
+            '#prefix' => sprintf('<p>You have connected your account to the RunKeeper profile of <strong>%s</strong></p>',
+                $profile->runkeeper_full_name),
+            '#type' => "submit",
+            '#value' => "Disconnect from Runkeeper",
+            '#weight' => 50
+        );
+        
+    } else {
+        // User is not joined.
+                
+        $form['#action'] = base_path() . 'runkeeper/authorize/' . $uid;
+        
+        $form[GADGETEERING_RUNKEEPER_FIELD_SUBMIT] = array(
+            '#prefix' => '<p>Your account is not currently joined to a RunKeeper account</p>',
+            '#type' => "submit",
+            '#value' => "Connect to Runkeeper",
+            '#weight' => 50,
+        );
+    }
+    return $form;
+}
+
+/**
+ * Gets a user's Runkeeper profile information from the database.
+ */
+function _gadgeteering_runkeeper_get_user_profile($uid){
+    $profile = db_query('SELECT * FROM `gadgeteering_runkeeper_users` WHERE uid = :uid',
+        array(':uid'=>$uid))->fetchObject();
+        
+    return $profile;
+}
+
+?>

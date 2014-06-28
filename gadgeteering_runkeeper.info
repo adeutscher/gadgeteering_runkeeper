@@ -1,0 +1,6 @@
+name = Runkeeper Activity Display
+description = Displays information using the Runkeeper API.
+package = Gadgeteering
+core = 7.x
+dependencies[] = block
+stylesheets[all][] = gadgeteering_runkeeper.css
