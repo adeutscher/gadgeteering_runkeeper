@@ -96,11 +96,6 @@ function _gadgeteering_runkeeper_get_url_return($uid){
     return (($is_https) ? 'https://' : 'http://') . $_SERVER['SERVER_NAME'] . $port .  base_path() . GADGETEERING_RUNKEEPER_PATH_TOKEN . '/' . $uid;
 }
 
-function gadgeteering_runkeeper_node_view($node, $view_mode, $langcode){
-    drupal_set_message('Loading a node!');
-}
-
-
 /**
  * 
  * @param stdClass $runKeeperUser
@@ -401,7 +396,6 @@ function gadgeteering_runkeeper_block_info(){
 }
 
 function gadgeteering_runkeeper_block_view($blockId){
-    drupal_set_message('Id: ' . $blockId);
     
     $block = array();
     
