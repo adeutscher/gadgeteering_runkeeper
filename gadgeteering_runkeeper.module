@@ -117,6 +117,13 @@ function _gadgeteering_runkeeper_update_user($runKeeperUser){
     
     foreach($recentActivities->items as $activity){
         
+        //_gadgeteering_runkeeper_debug_message(sprintf('<pre>%s</pre>',print_r($activity,1)));
+        
+        if(!$activity->duration){
+            _gadgeteering_runkeeper_debug_message('No duration data. Assuming that this is a glitched entry and ignoring.');
+            continue;
+        }
+        
         // Get array from a breakdown of the activity URI.
         $activityArray = explode('/',$activity->uri);
         // Get activity ID number.
@@ -137,6 +144,8 @@ function _gadgeteering_runkeeper_update_user($runKeeperUser){
         // Get the details for the activity.
         $activityDetails = _gadgeteering_runkeeper_do_get_query($runKeeperUser->token,$activity->uri);
         
+        //_gadgeteering_runkeeper_debug_message(sprintf('<pre>%s</pre>',print_r($activityDetails,1)));
+        
         _gadgeteering_runkeeper_debug_message(sprintf('New activity: %s',$activity->uri));
         
         // Calculate the fields that aren't already provided for us in the activity objects.
@@ -151,18 +160,43 @@ function _gadgeteering_runkeeper_update_user($runKeeperUser){
             ':distance'=>$activityDetails->total_distance,
             ':calories'=>$activityDetails->total_calories,
             ':ascent'=>$activityDetails->climb,
-            ':start_elevation'=>$activityDetails->path[0]->altitude,
-            ':start_lat'=>$activityDetails->path[0]->latitude,
-            ':start_long'=>$activityDetails->path[0]->longitude,
-            ':end_elevation'=>$activityDetails->path[sizeof($activityDetails->path)-1]->altitude,
-            ':end_lat'=>$activityDetails->path[sizeof($activityDetails->path)-1]->latitude,
-            ':end_long'=>$activityDetails->path[sizeof($activityDetails->path)-1]->longitude,
             ':uri'=>$activity->uri,
             ':type'=>$activity->type
             );
             
+            if(isset($activityDetails->path) && sizeof($activityDetails)){
+                if(isset($activityDetails->path[0]->altitude))
+                    $substitutions[':start_elevation'] = $activityDetails->path[0]->altitude;
+                else
+                    $substitutions[':start_elevation'] = 0;
+                if(isset($activityDetails->path[0]->latitude))
+                    $substitutions[':start_lat'] = $activityDetails->path[0]->latitude;
+                else
+                    $substitutions[':start_lat'] = 0;
+                if(isset($activityDetails->path[0]->longitude))
+                    $substitutions[':start_long'] = $activityDetails->path[0]->longitude;
+                else
+                    $substitutions[':start_long'] = 0;
+                
+                if(isset($activityDetails->path[sizeof($activityDetails->path)-1]->altitude))
+                    $substitutions[':end_elevation'] = $activityDetails->path[sizeof($activityDetails->path)-1]->altitude;
+                else
+                    $substitutions[':end_elevation'] = 0;
+                if(isset($activityDetails->path[sizeof($activityDetails->path)-1]->latitude))
+                    $substitutions[':end_lat'] = $activityDetails->path[sizeof($activityDetails->path)-1]->latitude;
+                else
+                    $substitutions[':end_lat'] = 0;
+                if(isset($activityDetails->path[sizeof($activityDetails->path)-1]->longitude))
+                    $substitutions[':end_long'] = $activityDetails->path[sizeof($activityDetails->path)-1]->longitude;
+                else
+                    $substitutions[':end_long'] = 0;
+            }
+            
+            
         if($activityObj){
             // Updates
+            
+            _gadgeteering_runkeeper_debug_message('Updating an existing record.');
             
             $query =  'UPDATE gadgeteering_runkeeper_activities
                 SET `uid`=:uid, `runkeeper_aid`=:runkeeper_aid, `runkeeper_uid`=:runkeeper_uid,
@@ -174,6 +208,9 @@ function _gadgeteering_runkeeper_update_user($runKeeperUser){
             
         } else {
             // New
+            
+            _gadgeteering_runkeeper_debug_message('Inserting a new record.');
+            
             $query =  'INSERT INTO gadgeteering_runkeeper_activities
                 (`uid`, `runkeeper_aid`, `runkeeper_uid`, `filed`,
                 `start`,`end`,`distance`,`calories`,
