@@ -13,7 +13,7 @@ const GADGETEERING_RUNKEEPER_FIELD_ACTION = 'form_action';
 const GADGETEERING_RUNKEEPER_FIELD_REDIRECT = 'redirect_url';
 
 // Paths
-const GADGETEERING_RUNKEEPER_PATH_ADMIN = 'admin/settings/runkeeper';
+const GADGETEERING_RUNKEEPER_PATH_ADMIN = 'admin/config/services/runkeeper';
 const GADGETEERING_RUNKEEPER_PATH_AUTHORIZE = 'runkeeper/authorize/%';
 const GADGETEERING_RUNKEEPER_PATH_DEAUTHORIZE = 'runkeeper/authorize/%';
 const GADGETEERING_RUNKEEPER_PATH_PROFILE = 'user/%/runkeeper';
